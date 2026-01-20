@@ -7,7 +7,8 @@ use Webkernel\Fastboot;
 if (!class_exists(FastApplication::class, false)) {
   final class FastApplication extends Fastboot
   {
-    public const string SERIAL = '1.0.0-2025-a3f7b9c2';
+    public const string VERSION = '0.1.0';
+    public const string YEAR = '2026';
   }
 }
 return FastApplication::boot();
