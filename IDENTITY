@@ -1,0 +1,24 @@
+WARNING — PROTECTED CORE
+Webkernel™ is the intellectual property of Numerimondes.
+
+This directory contains the governed Core. The embedded serial is an
+instance identity marker (Version, Release Year, Unique Suffix).
+It allows the central server to recognize your instance and decide
+module delivery.
+
+INTEGRITY NOTICE:
+Only unmodified cores are eligible for:
+- Official updates and security patches
+- Marketplace module delivery
+- Enterprise support and certifications
+
+Any alteration, fork, or manual patch:
+1. Voids all functional guarantees.
+2. Terminates access to update channels and modules.
+3. Risks systemic regressions and security vulnerabilities.
+
+Numerimondes is the sole authority for Webkernel™ evolution. Modified
+versions are unsupported, untrusted, and must not present themselves
+as official Webkernel™ distributions.
+
+DO NOT MODIFY THIS CORE UNLESS YOU FULLY ACCEPT THE CONSEQUENCES.
