@@ -9,11 +9,17 @@ use Symfony\Component\Console\Output\ConsoleOutput;
 
 final class CommandLineInterface
 {
+  /**
+   * Run the CLI kernel with argv rewriting for WebKernel aliases.
+   *
+   * @param array<int, string> $argv
+   */
   public static function run(array $argv): int
   {
+    /** @var Kernel $kernel */
     $kernel = app()->make(Kernel::class);
 
-    // Command aliases mapping
+    /** @var array<string, string> $aliases */
     $aliases = [
       'require-module' => 'webkernel:install',
       'install' => 'webkernel:install',
@@ -23,7 +29,6 @@ final class CommandLineInterface
       'update' => 'webkernel:kernel-update',
     ];
 
-    // Rewrite argv for aliases
     if (isset($argv[1]) && isset($aliases[$argv[1]])) {
       $argv[1] = $aliases[$argv[1]];
     }
@@ -31,34 +36,37 @@ final class CommandLineInterface
     $input = new ArgvInput($argv);
     $output = new ConsoleOutput();
 
-    // Keeping custom filtering and display block
     if (!isset($argv[1]) || $argv[1] === 'list' || $argv[1] === '--help' || $argv[1] === '-h') {
       $kernel->bootstrap();
+
       $commands = $kernel->all();
 
-      $webkernelCommands = array_filter(array_keys($commands), fn($name) => str_starts_with($name, 'webkernel:'));
+      $webkernelCommandNames = array_values(
+        array_filter(array_keys($commands), static fn(string $name): bool => str_starts_with($name, 'webkernel:')),
+      );
 
       $output->writeln('');
       $output->writeln('<fg=green>WebKernel Module Manager</>');
       $output->writeln('');
       $output->writeln('<fg=yellow>Available Commands:</>');
 
-      foreach ($webkernelCommands as $commandName) {
+      foreach ($webkernelCommandNames as $commandName) {
         $command = $commands[$commandName];
+
         $description = $command->getDescription();
         $aliasNames = array_keys($aliases, $commandName);
 
-        $displayName = $commandName;
-        if (!empty($aliasNames)) {
-          $aliasDisplay = implode(', ', array_map(fn($a) => "<fg=cyan>{$a}</>", $aliasNames));
-          $output->writeln("  <fg=green>{$displayName}</> ({$aliasDisplay})");
+        if ($aliasNames !== []) {
+          $aliasDisplay = implode(', ', array_map(static fn(string $a): string => "<fg=cyan>{$a}</>", $aliasNames));
+          $output->writeln("  <fg=green>{$commandName}</> ({$aliasDisplay})");
         } else {
-          $output->writeln("  <fg=green>{$displayName}</>");
+          $output->writeln("  <fg=green>{$commandName}</>");
         }
 
-        if ($description) {
+        if ($description !== '') {
           $output->writeln("    {$description}");
         }
+
         $output->writeln('');
       }
 
@@ -77,6 +85,7 @@ final class CommandLineInterface
 
     $status = $kernel->handle($input, $output);
     $kernel->terminate($input, $status);
+
     return $status;
   }
 }
