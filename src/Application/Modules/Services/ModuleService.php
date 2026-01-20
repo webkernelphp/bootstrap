@@ -19,7 +19,7 @@ final class ModuleService
   private const string TEMP_PREFIX_BACKUP = 'wk-backup-';
   private const string KERNEL_BACKUP_NAME = 'kernel';
   private const array PRESERVED_DIRS = ['var-elements'];
-  private const array EXCLUDED_BACKUP_PATTERNS = ['*/backups/*', '*/locks/*', '*.lock'];
+
   private const string HOOK_INSTALL_FILE = 'webkernel-install.php';
   private const string HOOK_UPDATE_FILE = 'webkernel-update.php';
   private const string MODULE_FILE_PATTERN = '/*Module.php';
@@ -238,10 +238,6 @@ final class ModuleService
     $this->lock->acquire('update-kernel');
 
     try {
-      $baseDir = base_path(Config::BOOTSTRAP_DIR);
-
-      $this->cleanRecursiveBackups($baseDir);
-
       $this->log(self::LOG_FIND_PROVIDER, self::BOOTSTRAP_REPO);
       $provider = $this->findProvider(self::BOOTSTRAP_REPO);
 
@@ -435,39 +431,5 @@ final class ModuleService
       }
     }
   }
-
-  private function cleanRecursiveBackups(string $baseDir): void
-  {
-    $cacheDir = "{$baseDir}/cache";
-
-    if (!is_dir($cacheDir)) {
-      return;
-    }
-
-    $backupPatterns = ["{$cacheDir}/webkernel/backups", "{$cacheDir}/**/backups"];
-
-    foreach ($backupPatterns as $pattern) {
-      $matches = glob($pattern, GLOB_ONLYDIR);
-      if ($matches === false) {
-        continue;
-      }
-
-      foreach ($matches as $backupDir) {
-        if (is_dir($backupDir) && str_contains($backupDir, '/backups')) {
-          $this->log('  • Cleaning recursive backup: %s', basename($backupDir));
-          File::deleteDirectory($backupDir);
-        }
-      }
-    }
-
-    $lockDirs = glob("{$cacheDir}/**/.locks", GLOB_ONLYDIR);
-    if ($lockDirs !== false) {
-      foreach ($lockDirs as $lockDir) {
-        if (is_dir($lockDir)) {
-          $this->log('  • Cleaning old locks: %s', $lockDir);
-          File::deleteDirectory($lockDir);
-        }
-      }
-    }
-  }
+  /**END OF FILE */
 }

@@ -316,22 +316,14 @@ final class KernelUpdateCommand extends Command
 
     foreach ($pathsToClean as $path) {
       $fullPath = base_path($path);
-
       if (is_dir($fullPath)) {
         $this->debug("Removing: {$path}");
-
-        $files = glob($fullPath . '/*');
-        if ($files !== false) {
-          foreach ($files as $file) {
-            if (is_file($file)) {
-              @unlink($file);
-            } elseif (is_dir($file)) {
-              \Illuminate\Support\Facades\File::deleteDirectory($file);
-            }
-          }
-        }
+        \Illuminate\Support\Facades\File::deleteDirectory($fullPath);
       }
     }
+
+    $backupManager = new BackupManager();
+    $backupManager->cleanExpiredBackups(48);
 
     $this->debug('Artifacts cleaned');
   }
