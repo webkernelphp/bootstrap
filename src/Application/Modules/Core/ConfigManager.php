@@ -2,8 +2,8 @@
 
 namespace Webkernel\Modules\Core;
 
-use Webkernel\Modules\Exceptions\ModuleException;
 use Illuminate\Support\Facades\File;
+use Webkernel\CryptData;
 
 final class ConfigManager
 {
@@ -25,43 +25,55 @@ final class ConfigManager
 
     $json = File::get($this->configPath);
     $data = json_decode($json, true);
-
     $this->data = is_array($data) ? $data : [];
   }
 
-  public function getToken(): ?string
+  public function getGithubToken(string $owner, ?string $repo = null): ?string
   {
-    return $this->data['token'] ?? null;
+    // 1. Chercher d'abord le token spécifique au repo
+    if ($repo && isset($this->data['github_tokens'][$owner]['repos'][$repo])) {
+      return CryptData::decrypt($this->data['github_tokens'][$owner]['repos'][$repo]);
+    }
+
+    // 2. Sinon chercher le token général de l'owner
+    if (isset($this->data['github_tokens'][$owner]['global'])) {
+      return CryptData::decrypt($this->data['github_tokens'][$owner]['global']);
+    }
+
+    return null;
   }
 
-  public function saveToken(string $token): void
+  public function saveGithubToken(string $owner, string $token, ?string $repo = null): void
   {
     File::ensureDirectoryExists(dirname($this->configPath));
 
-    $this->data['token'] = $token;
-    $this->data['updated_at'] = now()->toIso8601String();
+    // Initialisation sécurisée des niveaux de tableaux
+    if (!isset($this->data['github_tokens']) || !is_array($this->data['github_tokens'])) {
+      $this->data['github_tokens'] = [];
+    }
 
-    $json = json_encode($this->data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+    if (!isset($this->data['github_tokens'][$owner]) || !is_array($this->data['github_tokens'][$owner])) {
+      $this->data['github_tokens'][$owner] = [
+        'global' => null,
+        'repos' => [],
+      ];
+    }
 
-    File::put($this->configPath, $json);
-    File::chmod($this->configPath, 0600);
-  }
+    if ($repo) {
+      // S'assurer que la clé 'repos' existe
+      if (!isset($this->data['github_tokens'][$owner]['repos'])) {
+        $this->data['github_tokens'][$owner]['repos'] = [];
+      }
+      $this->data['github_tokens'][$owner]['repos'][$repo] = CryptData::encrypt($token);
+    } else {
+      $this->data['github_tokens'][$owner]['global'] = CryptData::encrypt($token);
+    }
 
-  public function get(string $key, mixed $default = null): mixed
-  {
-    return $this->data[$key] ?? $default;
-  }
-
-  public function set(string $key, mixed $value): void
-  {
-    $this->data[$key] = $value;
     $this->save();
   }
 
   private function save(): void
   {
-    File::ensureDirectoryExists(dirname($this->configPath));
-
     $this->data['updated_at'] = now()->toIso8601String();
 
     $json = json_encode($this->data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);

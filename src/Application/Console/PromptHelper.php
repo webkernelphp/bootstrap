@@ -8,6 +8,7 @@ use function Laravel\Prompts\warning;
 use function Laravel\Prompts\error;
 use function Laravel\Prompts\info;
 use function Laravel\Prompts\spin;
+use function Laravel\Prompts\password;
 
 /**
  * Helper wrapper for Laravel Prompts functions
@@ -84,5 +85,36 @@ final class PromptHelper
   public static function spin(callable $callback, string $message): mixed
   {
     return spin($callback, $message);
+  }
+
+  /**
+   * Display a hidden text input prompt (e.g. for tokens/passwords)
+   *
+   * @param string $label
+   * @param string $placeholder
+   * @param bool $required
+   * @param callable|null $validate
+   * @return string
+   */
+  public static function textHidden(
+    string $label,
+    string $placeholder = '',
+    bool $required = false,
+    ?callable $validate = null,
+  ): string {
+    return password(label: $label, placeholder: $placeholder, required: $required, validate: $validate);
+  }
+
+  /**
+   * Display a success message
+   *
+   * @param string $message Success message
+   * @return void
+   */
+  public static function success(string $message): void
+  {
+    // Laravel Prompts uses info for general positive feedback,
+    // but you can prefix it with a checkmark for clarity.
+    info("[SUCCESS] {$message}");
   }
 }

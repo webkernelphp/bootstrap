@@ -203,6 +203,7 @@ abstract class Fastboot
     $providers = [
       # \Webkernel\Bridges\SystemPanelProvider::class,
       # \Webkernel\Bridges\BridgeServiceProvider::class,
+      \Webkernel\Panels\ThemeServiceProvider::class,
       \Webkernel\AppPanelProvider::class,
       \Webkernel\CliServiceProvider::class,
       ...self::$manifest['providers']['critical'] ?? [],

@@ -6,7 +6,7 @@ final class Config
 {
   public const string LOCK_DIR = 'bootstrap/cache/webkernel/locks';
   public const string BACKUP_DIR = 'bootstrap/cache/webkernel/backups';
-  public const string CONFIG_FILE = '.webkernel/config.json';
+  public const string CONFIG_FILE = 'storage/system/keys/config.json';
   public const string MODULE_DIR = 'app-platform';
   public const string BOOTSTRAP_DIR = 'bootstrap';
   public const string COMPOSER_JSON = 'composer.json';

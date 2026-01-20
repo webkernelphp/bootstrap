@@ -1,20 +1,31 @@
 <?php declare(strict_types=1);
-
 namespace Webkernel\Modules\Providers;
 
 use Webkernel\Modules\Core\Contracts\SourceProvider;
 use Webkernel\Modules\Exceptions\NetworkException;
-use Webkernel\Modules\Exceptions\ModuleException;
 use Webkernel\Modules\Exceptions\IntegrityException;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\File;
+use Illuminate\Http\Client\Response;
+use Webkernel\Console\PromptHelper;
+use Webkernel\Modules\Core\ConfigManager;
 use ZipArchive;
 
 final class GitHubProvider implements SourceProvider
 {
   private const string API_BASE = 'https://api.github.com';
+  private ConfigManager $config;
+  private bool $tokenLoadedFromConfig = false;
 
-  public function __construct(private ?string $token = null, private bool $insecure = false) {}
+  public function __construct(private ?string $token = null, private bool $insecure = false)
+  {
+    $this->config = new ConfigManager();
+  }
+
+  public function getToken(): ?string
+  {
+    return $this->token;
+  }
 
   public function supports(string $identifier): bool
   {
@@ -25,159 +36,459 @@ final class GitHubProvider implements SourceProvider
   {
     [$owner, $repo] = $this->parseIdentifier($identifier);
 
-    if (!$owner || !$repo) {
+    if (!$this->token) {
+      $loaded = $this->config->getGithubToken($owner, $repo);
+      if (is_string($loaded) && trim($loaded) !== '') {
+        $this->token = trim($loaded);
+        $this->tokenLoadedFromConfig = true;
+      }
+    }
+
+    try {
+      $this->detectRepositoryVisibility($owner, $repo);
+    } catch (NetworkException $e) {
+      PromptHelper::error($e->getMessage());
       return null;
     }
 
-    $url = sprintf('%s/repos/%s/%s/releases', self::API_BASE, $owner, $repo);
+    return $this->executeFetch($owner, $repo, $includePreReleases);
+  }
 
-    $request = Http::withHeaders([
-      'Accept' => 'application/vnd.github.v3+json',
+  private function detectRepositoryVisibility(string $owner, string $repo): bool
+  {
+    $repoUrl = sprintf('%s/repos/%s/%s', self::API_BASE, $owner, $repo);
+
+    $anonRequest = Http::withHeaders([
+      'Accept' => 'application/vnd.github+json',
+      'X-GitHub-Api-Version' => '2022-11-28',
+      'User-Agent' => 'WebKernel-Installer',
     ]);
 
-    if ($this->token) {
-      $request->withToken($this->token);
-    }
-
     if ($this->insecure) {
-      $request->withoutVerifying();
+      $anonRequest = $anonRequest->withoutVerifying();
     }
 
-    $response = $request->get($url);
+    /** @var Response $anonResponse */
+    $anonResponse = $anonRequest->get($repoUrl);
+
+    if ($anonResponse->successful()) {
+      return true;
+    }
+
+    if ($anonResponse->status() === 404) {
+      $confirmed = PromptHelper::confirm(
+        label: "Repository {$owner}/{$repo} returned 404. It could be private or non-existent. Are you sure it exists?",
+        default: false,
+      );
+
+      if (!$confirmed) {
+        throw new NetworkException("Repository {$owner}/{$repo} not confirmed by user.");
+      }
+
+      if (!$this->token || trim($this->token) === '') {
+        $this->askForTokenInteractively($owner, $repo);
+      }
+
+      $authResponse = $this->authenticatedRequest($repoUrl);
+
+      if ($authResponse->successful()) {
+        return true;
+      }
+
+      if ($authResponse->status() === 404) {
+        $shouldRetry =
+          $this->tokenLoadedFromConfig ||
+          PromptHelper::confirm(
+            label: 'Token cannot access this repository (404). Try a different token?',
+            default: true,
+          );
+
+        if ($shouldRetry) {
+          $this->showTokenHelp($owner, $repo);
+          $this->askForTokenInteractively($owner, $repo);
+          $retry = $this->authenticatedRequest($repoUrl);
+
+          if ($retry->successful()) {
+            return true;
+          }
+
+          if ($retry->status() === 404) {
+            throw new NetworkException(
+              "Still cannot access {$owner}/{$repo} with new token. " .
+                "If using fine-grained token: go to token settings and add this repository to 'Repository access'. " .
+                "Or use a classic token with 'repo' scope instead.",
+            );
+          }
+
+          throw new NetworkException(
+            "Failed to access repository. Status: {$retry->status()}. Response: {$retry->body()}",
+          );
+        }
+
+        throw new NetworkException("Cannot access {$owner}/{$repo} with provided token. Check token permissions.");
+      }
+
+      throw new NetworkException(
+        "Failed to access repository. Status: {$authResponse->status()}. Response: {$authResponse->body()}",
+      );
+    }
+
+    throw new NetworkException(
+      "Failed to detect repository visibility. Status: {$anonResponse->status()}. Response: {$anonResponse->body()}",
+    );
+  }
+
+  private function showTokenHelp(string $owner, string $repo): void
+  {
+    PromptHelper::warning("RECOMMENDED: Use a classic token with 'repo' scope");
+    PromptHelper::info("Classic: https://github.com/settings/tokens -> Generate (classic) -> Select 'repo'");
+    PromptHelper::info(
+      "Fine-grained: https://github.com/settings/personal-access-tokens -> Add {$owner}/{$repo} to 'Repository access' -> Enable Contents+Metadata permissions",
+    );
+  }
+
+  private function executeFetch(string $owner, string $repo, bool $includePreReleases): array
+  {
+    $url = sprintf('%s/repos/%s/%s/releases', self::API_BASE, $owner, $repo);
+    $response = $this->authenticatedRequest($url);
 
     if ($response->status() === 404) {
-      throw new NetworkException("Repository {$owner}/{$repo} not found");
+      PromptHelper::info('No releases found. Attempting branch fallback...');
+      return $this->handleBranchFallback($owner, $repo);
     }
 
-    if ($response->failed()) {
-      throw new NetworkException("GitHub API error: HTTP {$response->status()}");
+    if (!$response->successful()) {
+      throw new NetworkException(
+        "Failed to fetch releases. Status: {$response->status()}. Response: {$response->body()}",
+      );
     }
 
     $data = $response->json();
-
-    if (!is_array($data)) {
-      return null;
+    if (empty($data) || !is_array($data)) {
+      PromptHelper::info('No releases found. Using default branch as fallback.');
+      return $this->handleBranchFallback($owner, $repo);
     }
 
-    return array_filter($data, function ($release) use ($includePreReleases) {
-      if ($release['draft'] ?? false) {
-        return false;
-      }
+    $filtered = array_values(
+      array_filter($data, static function (mixed $release) use ($includePreReleases): bool {
+        if (!is_array($release)) {
+          return false;
+        }
+        if (($release['draft'] ?? false) === true) {
+          return false;
+        }
+        if (!$includePreReleases && ($release['prerelease'] ?? false) === true) {
+          return false;
+        }
+        return true;
+      }),
+    );
 
-      if (!$includePreReleases && ($release['prerelease'] ?? false)) {
-        return false;
-      }
+    if ($filtered === []) {
+      PromptHelper::info('No suitable releases found. Using default branch as fallback.');
+      return $this->handleBranchFallback($owner, $repo);
+    }
 
-      return true;
-    });
+    return $filtered;
+  }
+
+  private function handleBranchFallback(string $owner, string $repo): array
+  {
+    $repoUrl = sprintf('%s/repos/%s/%s', self::API_BASE, $owner, $repo);
+    $response = $this->authenticatedRequest($repoUrl);
+
+    if (!$response->successful()) {
+      throw new NetworkException("Unable to retrieve repository information. Status: {$response->status()}");
+    }
+
+    $repoData = $response->json();
+    $branch = (string) ($repoData['default_branch'] ?? 'main');
+
+    PromptHelper::info("Using default branch: {$branch}");
+
+    return [
+      [
+        'tag_name' => $branch,
+        'name' => "Default Branch: {$branch}",
+        'zipball_url' => sprintf('%s/repos/%s/%s/zipball/%s', self::API_BASE, $owner, $repo, $branch),
+        'published_at' => now()->toIso8601String(),
+        'is_branch_fallback' => true,
+      ],
+    ];
+  }
+
+  private function authenticatedRequest(string $url): Response
+  {
+    $request = Http::withHeaders([
+      'Accept' => 'application/vnd.github+json',
+      'X-GitHub-Api-Version' => '2022-11-28',
+      'User-Agent' => 'WebKernel-Installer',
+    ]);
+
+    if ($this->token && trim($this->token) !== '') {
+      $request = $request->withToken(trim($this->token));
+    }
+
+    if ($this->insecure) {
+      $request = $request->withoutVerifying();
+    }
+
+    return $request->get($url);
+  }
+
+  private function askForTokenInteractively(string $owner, string $repo): void
+  {
+    PromptHelper::info('This repository is private and requires authentication.');
+
+    $this->token = trim(
+      PromptHelper::textHidden(
+        label: 'Enter GitHub Token (classic or fine-grained)',
+        placeholder: 'ghp_... or github_pat_...',
+        required: true,
+      ),
+    );
+
+    $this->tokenLoadedFromConfig = false;
+
+    $scope = PromptHelper::select('Save token for future use?', [
+      'repo' => "This repository only: {$owner}/{$repo}",
+      'owner' => "All repositories from: {$owner}",
+      'session' => 'Session only (not saved)',
+    ]);
+
+    if ($scope !== 'session') {
+      $repoArg = $scope === 'repo' ? $repo : null;
+      $this->config->saveGithubToken($owner, $this->token, $repoArg);
+      PromptHelper::success('Token saved.');
+    }
   }
 
   public function downloadRelease(array $release, string $targetDir): bool
   {
-    $request = Http::timeout(120);
-
-    if ($this->token) {
-      $request->withToken($this->token);
+    $zipUrl = (string) ($release['zipball_url'] ?? '');
+    if ($zipUrl === '') {
+      throw new NetworkException('Release has no zipball_url.');
     }
 
-    if ($this->insecure) {
-      $request->withoutVerifying();
-    }
+    $zipContent = $this->downloadZipball($zipUrl);
+    return $this->extractArchive($zipContent, $targetDir, $release);
+  }
 
-    $response = $request->get($release['zipball_url']);
+  private function downloadZipball(string $url): string
+  {
+    $maxRedirects = 10;
+    $currentUrl = $url;
+    $attempt = 0;
 
-    if ($response->failed()) {
-      throw new NetworkException('Download failed: HTTP ' . $response->status());
-    }
-
-    $zipContent = $response->body();
-
-    if (isset($release['assets']) && !empty($release['assets'])) {
-      foreach ($release['assets'] as $asset) {
-        if (str_ends_with($asset['name'], '.sha256')) {
-          if (!$this->verifyChecksum($zipContent, $release)) {
-            throw new IntegrityException('Checksum verification failed');
-          }
-          break;
-        }
+    while ($attempt++ < $maxRedirects) {
+      $ch = curl_init($currentUrl);
+      if ($ch === false) {
+        throw new NetworkException('Failed to initialize cURL.');
       }
+
+      $headers = ['User-Agent: WebKernel-Installer'];
+
+      $host = (string) (parse_url($currentUrl, PHP_URL_HOST) ?: '');
+      $isGitHub =
+        str_contains($host, 'github.com') ||
+        str_contains($host, 'githubusercontent.com') ||
+        str_contains($host, 'codeload.github.com');
+
+      if ($this->token && $isGitHub) {
+        $headers[] = 'Authorization: Bearer ' . trim($this->token);
+        $headers[] = 'Accept: application/vnd.github+json';
+        $headers[] = 'X-GitHub-Api-Version: 2022-11-28';
+      }
+
+      curl_setopt_array($ch, [
+        CURLOPT_RETURNTRANSFER => true,
+        CURLOPT_HEADER => true,
+        CURLOPT_FOLLOWLOCATION => false,
+        CURLOPT_HTTPHEADER => $headers,
+        CURLOPT_TIMEOUT => 300,
+        CURLOPT_CONNECTTIMEOUT => 30,
+      ]);
+
+      if ($this->insecure) {
+        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
+        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+      }
+
+      $raw = curl_exec($ch);
+      $error = curl_error($ch);
+      $httpCode = (int) curl_getinfo($ch, CURLINFO_HTTP_CODE);
+      $headerSize = (int) curl_getinfo($ch, CURLINFO_HEADER_SIZE);
+      curl_close($ch);
+
+      if ($raw === false) {
+        throw new NetworkException("Download failed: {$error}");
+      }
+
+      $headerText = substr($raw, 0, $headerSize);
+      $body = substr($raw, $headerSize);
+
+      if ($httpCode >= 300 && $httpCode < 400) {
+        $location = $this->extractHeaderValue($headerText, 'Location');
+        if (!$location) {
+          throw new NetworkException('Redirect without Location header.');
+        }
+
+        if (!parse_url($location, PHP_URL_SCHEME)) {
+          $location = $this->resolveRelativeUrl($currentUrl, $location);
+        }
+
+        $currentUrl = $location;
+        continue;
+      }
+
+      if ($httpCode === 200) {
+        PromptHelper::success('Downloaded ' . $this->formatBytes(strlen($body)));
+        return $body;
+      }
+
+      throw new NetworkException("Download failed with HTTP {$httpCode}");
     }
 
-    return $this->extractArchive($zipContent, $targetDir);
+    throw new NetworkException('Too many redirects.');
   }
 
   public function verifyChecksum(string $content, array $release): bool
   {
-    if (!isset($release['assets'])) {
+    $expectedChecksum = $release['checksum'] ?? ($release['sha256'] ?? null);
+    if (empty($expectedChecksum)) {
       return true;
     }
 
-    foreach ($release['assets'] as $asset) {
-      if (str_ends_with($asset['name'], '.sha256')) {
-        $checksumUrl = $asset['browser_download_url'];
-        $expectedChecksum = trim(Http::get($checksumUrl)->body());
-        $actualChecksum = hash('sha256', $content);
+    $actualChecksum = hash('sha256', $content);
+    if (!hash_equals((string) $actualChecksum, (string) $expectedChecksum)) {
+      throw new IntegrityException("Checksum mismatch. Expected: {$expectedChecksum}, Got: {$actualChecksum}");
+    }
 
-        return $expectedChecksum === $actualChecksum;
+    return true;
+  }
+
+  private function parseIdentifier(string $identifier): array
+  {
+    if (preg_match('#github\.com/([^/]+)/([^/]+?)(?:\.git)?$#i', $identifier, $m)) {
+      return [$m[1], $m[2]];
+    }
+    if (preg_match('#^([^/]+)/([^/]+)$#', $identifier, $m)) {
+      return [$m[1], $m[2]];
+    }
+    throw new NetworkException('Invalid GitHub identifier: ' . $identifier);
+  }
+
+  private function extractArchive(string $zipContent, string $targetDir, array $release): bool
+  {
+    $this->verifyChecksum($zipContent, $release);
+
+    $tempFile = tempnam(sys_get_temp_dir(), 'wk_module_');
+    if ($tempFile === false) {
+      throw new NetworkException('Failed to create temp file.');
+    }
+
+    if (file_put_contents($tempFile, $zipContent) === false) {
+      @unlink($tempFile);
+      throw new NetworkException('Failed to write temp file.');
+    }
+
+    try {
+      File::ensureDirectoryExists($targetDir);
+
+      $zip = new ZipArchive();
+      $openResult = $zip->open($tempFile);
+
+      if ($openResult !== true) {
+        throw new NetworkException("Failed to open ZIP. Error: {$openResult}");
+      }
+
+      if (!$zip->extractTo($targetDir)) {
+        $zip->close();
+        throw new NetworkException('Failed to extract ZIP.');
+      }
+
+      $zip->close();
+      $this->flattenGitHubArchive($targetDir);
+
+      PromptHelper::success("Extracted to {$targetDir}");
+      return true;
+    } finally {
+      if (file_exists($tempFile)) {
+        @unlink($tempFile);
+      }
+    }
+  }
+
+  private function flattenGitHubArchive(string $targetDir): void
+  {
+    $dirs = File::directories($targetDir);
+    if (count($dirs) !== 1) {
+      return;
+    }
+
+    $sourceDir = (string) $dirs[0];
+    $files = File::allFiles($sourceDir);
+
+    foreach ($files as $file) {
+      $relativePath = str_replace($sourceDir . DIRECTORY_SEPARATOR, '', $file->getPathname());
+      $targetPath = $targetDir . DIRECTORY_SEPARATOR . $relativePath;
+
+      File::ensureDirectoryExists(dirname($targetPath));
+
+      if (!File::move($file->getPathname(), $targetPath)) {
+        throw new NetworkException("Failed to move: {$file->getPathname()}");
       }
     }
 
-    return true;
+    File::deleteDirectory($sourceDir);
   }
 
-  private function parseIdentifier(string $id): array
+  private function extractHeaderValue(string $headers, string $name): ?string
   {
-    if (preg_match('#github\.com/([^/]+)/([^/]+?)(?:\.git)?$#i', $id, $m)) {
-      return [$m[1], $m[2]];
+    if (preg_match('/^' . preg_quote($name, '/') . ':\s*(.+)$/im', $headers, $m)) {
+      return trim($m[1]);
     }
-
-    if (preg_match('#^([^/]+)/([^/]+)$#', $id, $m)) {
-      return [$m[1], $m[2]];
-    }
-
-    return [null, null];
+    return null;
   }
 
-  private function extractArchive(string $zipContent, string $targetDir): bool
+  private function resolveRelativeUrl(string $base, string $relative): string
   {
-    $tempFile = tempnam(sys_get_temp_dir(), 'wk-');
-    file_put_contents($tempFile, $zipContent);
-
-    File::ensureDirectoryExists($targetDir);
-
-    $zip = new ZipArchive();
-
-    if ($zip->open($tempFile) !== true) {
-      unlink($tempFile);
-      throw new ModuleException('Invalid ZIP archive');
+    if (parse_url($relative, PHP_URL_SCHEME) !== null) {
+      return $relative;
     }
 
-    $zip->extractTo($targetDir);
-    $zip->close();
-    unlink($tempFile);
+    $baseParts = parse_url($base);
+    $scheme = (string) ($baseParts['scheme'] ?? 'https');
+    $host = (string) ($baseParts['host'] ?? '');
+    $port = isset($baseParts['port']) ? ':' . (string) $baseParts['port'] : '';
+    $basePath = (string) ($baseParts['path'] ?? '/');
 
-    $dirs = File::directories($targetDir);
-
-    if (count($dirs) === 1) {
-      $this->flattenDirectory($dirs[0], $targetDir);
+    if (str_starts_with($relative, '/')) {
+      return "{$scheme}://{$host}{$port}{$relative}";
     }
 
-    return true;
+    $baseDir = (string) preg_replace('#/[^/]*$#', '/', $basePath);
+    $full = "{$scheme}://{$host}{$port}{$baseDir}{$relative}";
+    $norm = (string) preg_replace('#(/\.?/)#', '/', $full);
+
+    while (strpos($norm, '/../') !== false) {
+      $norm = (string) preg_replace('#/[^/]+/\.\./#', '/', $norm, 1);
+    }
+
+    return $norm;
   }
 
-  private function flattenDirectory(string $source, string $dest): void
+  private function formatBytes(int $bytes): string
   {
-    $files = File::allFiles($source);
-    $directories = File::directories($source);
+    $units = ['B', 'KB', 'MB', 'GB'];
+    $i = 0;
+    $value = (float) $bytes;
 
-    foreach ($files as $file) {
-      $relativePath = str_replace($source . '/', '', $file->getPathname());
-      $targetPath = $dest . '/' . $relativePath;
-
-      File::ensureDirectoryExists(dirname($targetPath));
-      File::move($file->getPathname(), $targetPath);
+    while ($value >= 1024 && $i < count($units) - 1) {
+      $value /= 1024;
+      $i++;
     }
 
-    File::deleteDirectory($source);
+    return round($value, 2) . ' ' . $units[$i];
   }
 }

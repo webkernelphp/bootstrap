@@ -1,5 +1,4 @@
 <?php declare(strict_types=1);
-
 namespace Webkernel\Console\Commands;
 
 use Illuminate\Console\Command;
@@ -10,23 +9,13 @@ use Webkernel\Modules\Hooks\HookExecutor;
 use Webkernel\Modules\Providers\{GitHubProvider, WebKernelProvider};
 use Webkernel\Console\PromptHelper;
 
-/**
- * Install a WebKernel module from various sources
- *
- * @package Webkernel\Modules\Cli
- */
 final class InstallModuleCommand extends Command
 {
-  /**
-   * The name and signature of the console command
-   *
-   * @var string
-   */
   protected $signature = 'webkernel:install
                             {source : Module source (owner/repo, wk://module, etc)}
                             {--with-version= : Specific version to install}
                             {--latest : Install latest version}
-                            {--token= : Authentication token (required for private repos)}
+                            {--token= : Authentication token (manual override)}
                             {--save-token : Save token to config}
                             {--no-backup : Skip backup creation}
                             {--no-hooks : Skip hook execution}
@@ -35,44 +24,31 @@ final class InstallModuleCommand extends Command
                             {--pre-release : Include pre-releases}
                             {--dry-run : Simulate without making changes}';
 
-  /**
-   * The console command description
-   *
-   * @var string
-   */
   protected $description = 'Install a WebKernel module from a source provider (supports private GitHub repos)';
 
-  /**
-   * Execute the console command
-   *
-   * @return int Exit code (0 = success, 1 = failure)
-   */
   public function handle(): int
   {
+    $identifier = (string) $this->argument('source');
     $config = new ConfigManager();
-    $service = $this->createService();
+    $manualToken = $this->option('token') ? (string) $this->option('token') : null;
 
-    /** @var string $identifier */
-    $identifier = $this->argument('source');
-
-    // Handle token saving
-    if ($this->option('token') && $this->option('save-token')) {
-      $config->saveToken((string) $this->option('token'));
-      $this->components->info('Token saved successfully');
+    if ($manualToken && $this->option('save-token')) {
+      $owner = $this->extractOwnerFromSource($identifier);
+      if ($owner) {
+        $config->saveGithubToken($owner, $manualToken);
+        $this->components->info("Token for '{$owner}' saved successfully");
+      }
     }
 
-    // Show insecure warning if needed
     if ($this->option('insecure')) {
       $this->showInsecureWarning();
     }
 
-    // Confirm backup creation
     $createBackup = !$this->option('no-backup') && PromptHelper::confirm('Create backup before installation?', true);
 
-    // Create provider and fetch releases
-    $provider = $this->createProvider($identifier, $config);
+    // Create provider for fetching releases
+    $provider = $this->createProvider($identifier, $manualToken);
 
-    /** @var array<int, array{tag_name: string, name?: string, published_at?: string, prerelease?: bool}>|null $releases */
     $releases = PromptHelper::spin(
       fn() => $provider->fetchReleases($identifier, (bool) $this->option('pre-release')),
       "Fetching releases for {$identifier}...",
@@ -83,22 +59,25 @@ final class InstallModuleCommand extends Command
       return 1;
     }
 
-    // Select version to install
     $version = $this->selectVersion($releases);
     if (!$version) {
       PromptHelper::error('No version selected');
       return 1;
     }
 
-    // Install the module
-    /** @var array{success: bool, error?: string, dry_run?: bool, path?: string, version?: string, namespace?: string, install_path?: string} $result */
+    // Get the token from the provider (it may have been set during fetchReleases)
+    $providerToken = $provider->getToken();
+
+    // Create service with the token from the provider
+    $service = $this->createService($providerToken);
+
     $result = PromptHelper::spin(
       fn() => $service->installModule($identifier, $version, $createBackup),
       "Installing {$identifier} version {$version}...",
     );
 
     if ($result['success']) {
-      if (isset($result['dry_run'])) {
+      if (isset($result['dry_run']) && $result['dry_run']) {
         PromptHelper::info('[DRY RUN] Would have installed module');
         return 0;
       }
@@ -114,10 +93,10 @@ final class InstallModuleCommand extends Command
           ['Install Path', $result['install_path'] ?? 'N/A'],
         ],
       );
+
       $this->newLine();
       $this->components->info('Run the following to rebuild the manifest:');
       $this->line('  php bootstrap/Application/Arcanes/BuildManifest.php');
-
       return 0;
     }
 
@@ -125,12 +104,17 @@ final class InstallModuleCommand extends Command
     return 1;
   }
 
-  /**
-   * Select version from available releases
-   *
-   * @param array<int, array{tag_name: string, name?: string, published_at?: string, prerelease?: bool}> $releases
-   * @return string|null Selected version tag
-   */
+  private function extractOwnerFromSource(string $source): ?string
+  {
+    if (preg_match('#github\.com/([^/]+)/#i', $source, $m)) {
+      return $m[1];
+    }
+    if (preg_match('#^([^/]+)/#', $source, $m)) {
+      return $m[1];
+    }
+    return null;
+  }
+
   private function selectVersion(array $releases): ?string
   {
     if ($this->option('with-version')) {
@@ -138,26 +122,32 @@ final class InstallModuleCommand extends Command
     }
 
     if ($this->option('latest')) {
-      return $releases[0]['tag_name'];
+      return (string) ($releases[0]['tag_name'] ?? null);
     }
 
-    /** @var array<string, string> $options */
     $options = [];
     foreach ($releases as $release) {
+      $tag = (string) ($release['tag_name'] ?? '');
+      if ($tag === '') {
+        continue;
+      }
+
       $prerelease = $release['prerelease'] ?? false ? ' [PRE-RELEASE]' : '';
-      $published = substr($release['published_at'] ?? '', 0, 10);
-      $label = sprintf('%s - %s (%s)%s', $release['tag_name'], $release['name'] ?? '', $published, $prerelease);
-      $options[$release['tag_name']] = $label;
+      $published = (string) ($release['published_at'] ?? '');
+      $published = $published !== '' ? substr($published, 0, 10) : '';
+      $name = (string) ($release['name'] ?? '');
+      $label = sprintf('%s - %s (%s)%s', $tag, $name, $published, $prerelease);
+      $options[$tag] = $label;
     }
 
-    return PromptHelper::select('Select release to install', $options, $releases[0]['tag_name']);
+    if ($options === []) {
+      return null;
+    }
+
+    $default = array_key_first($options);
+    return PromptHelper::select('Select release to install', $options, $default);
   }
 
-  /**
-   * Display insecure mode warning and request confirmation
-   *
-   * @return void
-   */
   private function showInsecureWarning(): void
   {
     PromptHelper::warning('SSL verification disabled - INSECURE MODE ACTIVE');
@@ -170,16 +160,8 @@ final class InstallModuleCommand extends Command
     }
   }
 
-  /**
-   * Create appropriate provider based on identifier
-   *
-   * @param string $identifier Module identifier
-   * @param ConfigManager $config Configuration manager
-   * @return GitHubProvider|WebKernelProvider
-   */
-  private function createProvider(string $identifier, ConfigManager $config): GitHubProvider|WebKernelProvider
+  private function createProvider(string $identifier, ?string $token): GitHubProvider|WebKernelProvider
   {
-    $token = $this->option('token') ? (string) $this->option('token') : $config->getToken();
     $insecure = (bool) $this->option('insecure');
 
     if (str_contains($identifier, 'webkernelphp.com') || str_starts_with($identifier, 'wk://')) {
@@ -189,12 +171,7 @@ final class InstallModuleCommand extends Command
     return new GitHubProvider($token, $insecure);
   }
 
-  /**
-   * Create and configure ModuleService instance
-   *
-   * @return ModuleService
-   */
-  private function createService(): ModuleService
+  private function createService(?string $token = null): ModuleService
   {
     $lock = new LockManager();
     $backup = new BackupManager();
@@ -204,10 +181,7 @@ final class InstallModuleCommand extends Command
 
     $service = new ModuleService($lock, $backup, $composer, $validator, $hookExecutor);
 
-    $config = new ConfigManager();
-    $token = $this->option('token') ? (string) $this->option('token') : $config->getToken();
     $insecure = (bool) $this->option('insecure');
-
     $service->addProvider(new GitHubProvider($token, $insecure));
     $service->addProvider(new WebKernelProvider($token));
 

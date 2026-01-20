@@ -118,4 +118,9 @@ final class WebKernelProvider implements SourceProvider
 
     return $id;
   }
+
+  public function getToken(): ?string
+  {
+    return $this->token;
+  }
 }
